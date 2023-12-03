@@ -90,31 +90,194 @@ def bezier(Ps, n, t):
 
 def get_path(vehicle, tar_loc):
     v_loc = vehicle.get_location()
-    vx1 = v_loc.x
-    vy1 = v_loc.y
-    vx2 = tar_loc.x
-    vy2 = tar_loc.y
-    bias_x = 0.2 * math.cos(yaw)
-    bias_y = 0.2 * math.sin(yaw)
+    vx = v_loc.x
+    vy = v_loc.y
     ref = np.array([
-        [vx1, vy1],
-        [vx1 + bias_x, vy1 + bias_y],
-        [vx2, vy2],
-        [vx2 + bias_x, vy2 + bias_y]
+        [vx, vy],
+        [tar_loc[0].x, tar_loc[0].y],
+        [tar_loc[1].x, tar_loc[1].y],
+        [tar_loc[2].x, tar_loc[2].y]
     ])
     path = []  # 路径点存储
     # 贝塞尔曲线生成
-    for t in np.arange(0, 1.01, 0.01):
+    for t in np.arange(0, 1.0, 0.01):
         p_t = bezier(ref, len(ref), t)
         path.append(p_t)
     path = np.array(path)
     path.tolist()
     paths = []
     for i in range(len(path)):
-        paths.append(carla.Location(x=path[i][0], y=path[i][1], z=2.0))
+        paths.append(carla.Location(x=path[i][0], y=path[i][1], z=v_loc.z + 0.2))
+    for i in range(10, len(path) - 1, 10):
+        world.debug.draw_line(paths[i - 10], paths[i], thickness=0.1,
+                              life_time=0.1, color=carla.Color(b=255))
     world.debug.draw_line(paths[0], paths[1], thickness=0.1,
-                          life_time=20, color=carla.Color(b=255))
-    return paths
+                          life_time=25, color=carla.Color(r=255))
+    return path
+
+
+N = 100  # 迭代范围
+EPS = 1e-4  # 迭代精度
+Q = np.eye(3) * 1
+R = np.eye(2) * 20
+dt = 0.1  # 时间间隔，单位：s
+L = 2.875  # 车辆轴距，单位：m
+
+
+def MyReferencePath(path):
+    # set reference trajectory
+    # refer_path包括4维：位置x, 位置y， 轨迹点的切线方向, 曲率k
+    refer_path = np.zeros((100, 4))
+    refer_path[:, 0] = path[:, 0]  # x
+    refer_path[:, 1] = path[:, 1]  # y
+    # 使用差分的方式计算路径点的一阶导和二阶导，从而得到切线方向和曲率
+    for i in range(len(refer_path)):
+        if i == 0:
+            dx = refer_path[i + 1, 0] - refer_path[i, 0]
+            dy = refer_path[i + 1, 1] - refer_path[i, 1]
+            ddx = refer_path[2, 0] + refer_path[0, 0] - 2 * refer_path[1, 0]
+            ddy = refer_path[2, 1] + refer_path[0, 1] - 2 * refer_path[1, 1]
+        elif i == (len(refer_path) - 1):
+            dx = refer_path[i, 0] - refer_path[i - 1, 0]
+            dy = refer_path[i, 1] - refer_path[i - 1, 1]
+            ddx = refer_path[i, 0] + refer_path[i - 2, 0] - 2 * refer_path[i - 1, 0]
+            ddy = refer_path[i, 1] + refer_path[i - 2, 1] - 2 * refer_path[i - 1, 1]
+        else:
+            dx = refer_path[i + 1, 0] - refer_path[i, 0]
+            dy = refer_path[i + 1, 1] - refer_path[i, 1]
+            ddx = refer_path[i + 1, 0] + refer_path[i - 1, 0] - 2 * refer_path[i, 0]
+            ddy = refer_path[i + 1, 1] + refer_path[i - 1, 1] - 2 * refer_path[i, 1]
+        refer_path[i, 2] = math.atan2(dy, dx)  # yaw
+        # 计算曲率:设曲线r(t) =(x(t),y(t)),则曲率k=(x'y" - x"y')/((x')^2 + (y')^2)^(3/2).
+        refer_path[i, 3] = (ddy * dx - ddx * dy) / ((dx ** 2 + dy ** 2) ** (3 / 2))  # 曲率k计算
+    return refer_path
+
+
+def calc_track_error(refer_path, x, y):
+    """计算跟踪误差
+    Args:
+        x (_type_): 当前车辆的位置x
+        y (_type_): 当前车辆的位置y
+
+    Returns:
+        _type_: _description_
+    """
+    # 寻找参考轨迹最近目标点
+    d_x = [refer_path[i, 0] - x for i in range(len(refer_path))]
+    d_y = [refer_path[i, 1] - y for i in range(len(refer_path))]
+    d = [np.sqrt(d_x[i] ** 2 + d_y[i] ** 2) for i in range(len(d_x))]
+    s = np.argmin(d)  # 最近目标点索引
+
+    yaw = refer_path[s, 2]
+    k = refer_path[s, 3]
+    angle = normalize_angle(yaw - math.atan2(d_y[s], d_x[s]))
+    e = d[s]  # 误差
+    if angle < 0:
+        e *= -1
+
+    return e, k, yaw, s
+
+
+def normalize_angle(angle):
+    """
+    Normalize an angle to [-pi, pi].
+
+    :param angle: (float)
+    :return: (float) Angle in radian in [-pi, pi]
+    copied from https://atsushisakai.github.io/PythonRobotics/modules/path_tracking/stanley_control/stanley_control.html
+    """
+    while angle > np.pi:
+        angle -= 2.0 * np.pi
+
+    while angle < -np.pi:
+        angle += 2.0 * np.pi
+
+    return angle
+
+
+def cal_Ricatti(A, B, Q, R):
+    """解代数里卡提方程
+
+    Args:
+        A (_type_): 状态矩阵A
+        B (_type_): 状态矩阵B
+        Q (_type_): Q为半正定的状态加权矩阵, 通常取为对角阵；Q矩阵元素变大意味着希望跟踪偏差能够快速趋近于零；
+        R (_type_): R为正定的控制加权矩阵，R矩阵元素变大意味着希望控制输入能够尽可能小。
+
+    Returns:
+        _type_: _description_
+    """
+    # 设置迭代初始值
+    Qf = Q
+    P = Qf
+    # 循环迭代
+    for t in range(N):
+        P_ = Q + A.T @ P @ A - A.T @ P @ B @ np.linalg.pinv(R + B.T @ P @ B) @ B.T @ P @ A
+        if (abs(P_ - P).max() < EPS):
+            break
+        P = P_
+    return P_
+
+
+def state_space(vehicle, ref_delta, ref_yaw):
+    v = total_speed(vehicle)
+    A = np.matrix([
+        [1.0, 0.0, -v * dt * math.sin(ref_yaw)],
+        [0.0, 1.0, v * dt * math.cos(ref_yaw)],
+        [0.0, 0.0, 1.0]])
+
+    B = np.matrix([
+        [dt * math.cos(ref_yaw), 0],
+        [dt * math.sin(ref_yaw), 0],
+        [dt * math.tan(ref_delta) / L,
+         v * dt / (L * math.cos(ref_delta) * math.cos(ref_delta))]
+    ])
+
+    return A, B
+
+
+def lqr(robot_state, refer_path, s0, A, B, Q, R):
+    """
+    LQR控制器
+    """
+    # x为位置和航向误差
+    x = robot_state[0:3] - refer_path[s0, 0:3]
+
+    P = cal_Ricatti(A, B, Q, R)
+
+    K = -np.linalg.pinv(R + B.T @ P @ B) @ B.T @ P @ A
+    u = K @ x
+    u_star = u  # u_star = [[v-ref_v,delta-ref_delta]]
+    # print(u_star)
+    return u_star[0, 1]
+
+
+def lqr_controller(vehicle, path):
+    path = np.array(path)
+    path = MyReferencePath(path)
+    x = vehicle.get_location().x
+    y = vehicle.get_location().y
+    psi = vehicle.get_transform().rotation.yaw
+    psi = math.radians(psi)
+    v = total_speed(vehicle)
+    robot_state = np.zeros(4)
+    robot_state[0] = x
+    robot_state[1] = y
+    robot_state[2] = psi
+    robot_state[3] = v
+    e, k, ref_yaw, s0 = calc_track_error(path, robot_state[0], robot_state[1])
+    ref_delta = math.atan2(L * k, 1)
+    A, B = state_space(vehicle, ref_delta, ref_yaw)
+    delta = lqr(robot_state, path, s0, A, B, Q, R)
+    delta = delta + ref_delta
+    steer = math.tan(delta)
+    steer = math.atan(steer)
+    steer = math.degrees(steer) / 40
+    if steer > 1:
+        steer = 1
+    elif steer < -1:
+        steer = -1
+    return steer
 
 
 def distance(ego, vehicle):
@@ -127,10 +290,6 @@ def distance(ego, vehicle):
     #                 + (v1_loc.y * math.sin(v1_yaw) - v2_loc.y * math.sin(v2_yaw)) ** 2)
     # dis = dis_x + dis_y
     dis = math.sqrt((v1_loc.x - v2_loc.x) ** 2 + (v1_loc.y - v2_loc.y) ** 2)
-    print("-----------------------")
-    print(dis_y)
-    print(dis_x)
-    print(dis)
     return dis_x, dis_y, dis
 
 
@@ -214,11 +373,9 @@ try:
         total_v = total_speed(vehicle)
         total_v1 = total_speed(vehicle1)
         location_vehicle = vehicle.get_location()
-        world.debug.draw_line(location_vehicle, location_vehicle, thickness=0.1, life_time=20, color=carla.Color(r=255))
         if dis < 12 and total_v > total_v1:
             break
         time.sleep(t_s)
-        print(1)
 
     # 变道
     total_v = total_speed(vehicle)
@@ -231,22 +388,19 @@ try:
         location_vehicle1 = vehicle1.get_location()
         location_vehicle = vehicle.get_location()
         v_trans = vehicle.get_transform()
-        waypoint = map.get_waypoint(location_vehicle1, project_to_road=True, lane_type=carla.LaneType.Driving)
-        # 获取左侧车道的车道标记
-        left_lane_waypoint = waypoint.next(1.0)[0].get_left_lane()
-        # 获取左侧车道的位置
-        left_lane_location = left_lane_waypoint.transform.location
-        tar_loc = left_lane_location
-        path = get_path(vehicle, tar_loc)
-        tar_loc = path[n]
-        steer = pure_pursuit(tar_loc, v_trans)
+        waypoint = map.get_waypoint(location_vehicle1, project_to_road=True,
+                                    lane_type=carla.LaneType.Driving)
+        waypoints = []
+        waypoints.append(waypoint.next(0.5)[0].get_left_lane().transform.location)
+        waypoints.append(waypoint.next(1.0)[0].get_left_lane().transform.location)
+        waypoints.append(waypoint.next(1.5)[0].get_left_lane().transform.location)
+        path = get_path(vehicle, waypoints)
+        steer = lqr_controller(vehicle, path)
         throttle, brake, v_error = pid_control(vehicle, target_speed_2, v_error)
         vehicle.apply_control(carla.VehicleControl(throttle=throttle, brake=brake, steer=steer))
-        world.debug.draw_line(location_vehicle, location_vehicle, thickness=0.1, life_time=20, color=carla.Color(r=255))
         if dis < 4:
             break
         time.sleep(t_s)
-        print(2)
 
     # 持续超越
     total_v = total_speed(vehicle)
@@ -259,18 +413,17 @@ try:
         location_vehicle = vehicle.get_location()
         v_trans = vehicle.get_transform()
         waypoint = map.get_waypoint(location_vehicle, project_to_road=True, lane_type=carla.LaneType.Driving)
-        # 获取左侧车道的车道标记
-        tar_loc = waypoint.next(8.0)[0].transform.location
-        path = get_path(vehicle, tar_loc)
-        tar_loc = path[n]
-        steer = pure_pursuit(tar_loc, v_trans)
+        waypoints = []
+        waypoints.append(waypoint.next(8.0 + dis)[0].transform.location)
+        waypoints.append(waypoint.next(9.0 + dis)[0].transform.location)
+        waypoints.append(waypoint.next(10.0 + dis)[0].transform.location)
+        path = get_path(vehicle, waypoints)
+        steer = lqr_controller(vehicle, path)
         throttle, brake, v_error = pid_control(vehicle, target_speed_3, v_error)
         vehicle.apply_control(carla.VehicleControl(throttle=throttle, brake=brake, steer=steer))
-        world.debug.draw_line(location_vehicle, location_vehicle, thickness=0.1, life_time=20, color=carla.Color(r=255))
         if dis > 10:
             break
         time.sleep(t_s)
-        print(3)
 
     # 变回原道
     total_v = total_speed(vehicle)
@@ -283,14 +436,14 @@ try:
         location_vehicle = vehicle.get_location()
         v_trans = vehicle.get_transform()
         waypoint = map.get_waypoint(location_vehicle1, project_to_road=True, lane_type=carla.LaneType.Driving)
-        waypoints = waypoint.next(8 + dis)[0]
-        tar_loc = waypoints.transform.location
-        path = get_path(vehicle, tar_loc)
-        tar_loc = path[n]
-        steer = pure_pursuit(tar_loc, v_trans)
+        waypoints = []
+        waypoints.append(waypoint.next(8.0 + dis)[0].transform.location)
+        waypoints.append(waypoint.next(9.0 + dis)[0].transform.location)
+        waypoints.append(waypoint.next(10.0 + dis)[0].transform.location)
+        path = get_path(vehicle, waypoints)
+        steer = lqr_controller(vehicle, path)
         throttle, brake, v_error = pid_control(vehicle, target_speed_4, v_error)
         vehicle.apply_control(carla.VehicleControl(throttle=throttle, brake=brake, steer=steer))
-        world.debug.draw_line(location_vehicle, location_vehicle, thickness=0.1, life_time=20, color=carla.Color(r=255))
         if dis > 16:
             break
         time.sleep(t_s)
